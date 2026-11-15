@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><title>Operación Extracción</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:"Courier New",monospace;color:#eee}
+#hud{position:fixed;left:16px;top:12px;font-size:18px;line-height:1.5;text-shadow:0 0 4px #000}
+#hud b{color:#ffd54a}#hud .off{opacity:.5}
+#cross{position:fixed;left:50%;top:50%;width:6px;height:6px;margin:-3px;border-radius:50%;background:#ff3df0}
+#toast{position:fixed;left:50%;bottom:12%;transform:translateX(-50%);font-size:22px;text-shadow:0 0 6px #000}
+.ov{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000b;text-align:center;padding:20px}
+.ov h1{font-size:48px;margin:0 0 12px}.ov p{max-width:560px;line-height:1.5;color:#ccc}
+.ov button{margin-top:16px;padding:12px 32px;font-size:20px;cursor:pointer;border:0;border-radius:6px;background:#c62828;color:#fff}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head><body>
+<div id="hud"></div><div id="cross"></div><div id="toast"></div>
+<div id="ov" class="ov"><h1 id="t">OPERACIÓN EXTRACCIÓN</h1><p id="s">Cargando…</p><button id="b" style="display:none"></button></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as skClone } from 'three/addons/utils/SkeletonUtils.js';  // clona modelos con esqueleto
+
+/* ================= CONFIGURACIÓN (todo ajustable) ================= */
+const CFG = { hp: 2, detect: 16, runnerDetect: 22, zSpeed: 2.2, runnerSpeed: 3.6, playerSpeed: 5.5, catchDist: 0.9,
+              zombieHeight: 1.8, goal: -188, goalRadius: 4 };
+// RF01/RF02: dos armas GLB, cada una con su munición inicial y lo que da cada caja
+const WEAPONS = [
+  { name: 'Pistola', file: 'models/pistol.glb', len: .28, pos: [.22, -.22, -.55], ammo: 12, pack: 10, cd: .22, rotY: 0 },
+  { name: 'Rifle',   file: 'models/rifle.glb',  len: .8,  pos: [.18, -.2, -.35], ammo: 20, pack: 12, cd: .4,  rotY: 0 }];
+const ZOMBIE_FILES = ['models/zombie.glb', 'models/zombie_runner.glb'];
+
+/* ================= ESCENA ================= */
+const $ = id => document.getElementById(id);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1a3008); scene.fog = new THREE.Fog(0x1a3008, 8, 60);
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, .05, 200);
+camera.rotation.order = 'YXZ'; camera.position.set(0, 1.7, 5); scene.add(camera);
+const PIX = .4;  // resolución interna (menor = más pixelado)
+const renderer = new THREE.WebGLRenderer({ antialias: false }); renderer.setPixelRatio(1); renderer.setSize(innerWidth * PIX, innerHeight * PIX, false); document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xdfffa8, 0x557733, 3.4));
+const torch = new THREE.PointLight(0xe8ffb0, 90, 45, 1.5); camera.add(torch);
+const flashL = new THREE.PointLight(0x66ff33, 0, 6); flashL.position.set(.2, -.1, -.9); camera.add(flashL);
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth * PIX, innerHeight * PIX, false); });
+
+/* ================= NIVEL (RF03/RF08): 7 tramos en zigzag, inicio z=5, extracción z=-188 ================= */
+const walls = [], colliders = [];
+function addBox(x1, x2, z1, z2, h, color, tx) {
+  const t = (tx || wallTex).clone(); t.needsUpdate = true; t.repeat.set(Math.max(x2 - x1, z2 - z1) / 4, h / 2);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(x2 - x1, h, z2 - z1), new THREE.MeshStandardMaterial({ map: t, color, roughness: 1 }));
+  m.position.set((x1 + x2) / 2, h / 2, (z1 + z2) / 2); scene.add(m); walls.push(m); colliders.push({ x1, x2, z1, z2 });
+}
+const blocked = (x, z, r) => colliders.some(c => x > c.x1 - r && x < c.x2 + r && z > c.z1 - r && z < c.z2 + r);
+let seed = 7; const rnd = () => (seed = seed * 16807 % 2147483647) / 2147483647;
+// Texturas pixeladas generadas por código (filtro NEAREST = look retro)
+function mk(draw, rx, ry) { const c = document.createElement('canvas'); c.width = c.height = 32; draw(c.getContext('2d'));
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.magFilter = t.minFilter = THREE.NearestFilter; t.colorSpace = THREE.SRGBColorSpace; t.repeat.set(rx, ry); return t; }
+const noise = (g, b, v) => { for (let y = 0; y < 32; y++) for (let x = 0; x < 32; x++) { const k = (Math.random() - .5) * v; g.fillStyle = `rgb(${b[0] + k},${b[1] + k},${b[2] + k * .5})`; g.fillRect(x, y, 1, 1); } };
+const stripes = (g, b) => { noise(g, b, 45); g.fillStyle = '#0a0f05'; for (let y = 0; y < 32; y += 8) g.fillRect(0, y, 32, 1); };
+const wallTex = mk(g => stripes(g, [115, 118, 28]), 1, 1), crateTex = mk(g => stripes(g, [120, 85, 40]), 1, 1);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(30, 210), new THREE.MeshStandardMaterial({ map: mk(g => noise(g, [90, 145, 80], 35), 15, 105) }));
+floor.rotation.x = -Math.PI / 2; floor.position.set(0, 0, -94); scene.add(floor);
+const ceil = new THREE.Mesh(new THREE.PlaneGeometry(30, 210), new THREE.MeshStandardMaterial({ map: mk(g => stripes(g, [80, 85, 20]), 15, 105) }));
+ceil.rotation.x = Math.PI / 2; ceil.position.set(0, 4, -94); scene.add(ceil);
+const beamMat = new THREE.MeshStandardMaterial({ color: 0x1e3a22 });
+for (let z = 8; z > -197; z -= 6) { const b = new THREE.Mesh(new THREE.BoxGeometry(30, .35, .45), beamMat); b.position.set(0, 3.8, z); scene.add(b); }
+const WC = 0xffffff;
+addBox(-15, -14, -198, 10, 4, WC); addBox(14, 15, -198, 10, 4, WC); addBox(-15, 15, 9, 10, 4, WC); addBox(-15, 15, -198, -197, 4, WC);
+for (let k = 1; k <= 6; k++) { const z = -28 * k; k % 2 ? addBox(-14, 7, z - .5, z + .5, 4, 0xdddddd) : addBox(-7, 14, z - .5, z + .5, 4, 0xdddddd); }
+const segPos = j => { for (let i = 0; i < 30; i++) { const x = rnd() * 22 - 11, z = -28 * j - 5 - rnd() * 19; if (!blocked(x, z, 1.2)) return [x, z]; } return [0, -28 * j - 14]; };
+for (let j = 0; j < 7; j++) for (let i = 0; i < 2; i++) { const [x, z] = segPos(j), s = 1.4 + rnd(); addBox(x - s / 2, x + s / 2, z - s / 2, z + s / 2, 1.5, 0xffffff, crateTex); }
+const goal = new THREE.Mesh(new THREE.CylinderGeometry(CFG.goalRadius, CFG.goalRadius, .2, 32), new THREE.MeshStandardMaterial({ color: 0x00ff66, emissive: 0x00aa44 }));
+goal.position.set(0, .1, CFG.goal); scene.add(goal);
+const beam = new THREE.Mesh(new THREE.CylinderGeometry(.5, .5, 40, 12), new THREE.MeshBasicMaterial({ color: 0x00ff88, transparent: true, opacity: .3 }));
+beam.position.set(0, 20, CFG.goal); scene.add(beam);
+const gl = new THREE.PointLight(0x00ff88, 60, 30); gl.position.set(0, 3, CFG.goal); scene.add(gl);
+
+/* ================= CARGA GLB (RF01, RF04) ================= */
+function wrap(model, size, byHeight, rotY) {   // normaliza tamaño/orientación para cualquier GLB descargado
+  const g = new THREE.Group(); model.rotation.y = rotY; g.add(model); g.updateMatrixWorld(true);
+  const b = new THREE.Box3().setFromObject(g), sz = b.getSize(new THREE.Vector3());
+  model.scale.setScalar(size / (byHeight ? sz.y : Math.max(sz.x, sz.y, sz.z))); g.updateMatrixWorld(true);
+  const b2 = new THREE.Box3().setFromObject(g), c = b2.getCenter(new THREE.Vector3());
+  byHeight ? model.position.set(-c.x, -b2.min.y, -c.z) : model.position.sub(c); return g;
+}
+const loader = new GLTFLoader(), load = f => loader.loadAsync(f).then(g => g.scene);
+let action = null, state = 'menu', ammo = WEAPONS.map(w => w.ammo), cur = 0, yaw = 0, pitch = 0, kick = 0, lastShot = 0, bobT = 0;
+const zombies = [], pickups = [], keys = {};
+try {
+  const [a, b, z0, z1] = await Promise.all([...WEAPONS.map(w => load(w.file)), ...ZOMBIE_FILES.map(load)]);
+  [a, b].forEach((m, i) => { const w = WEAPONS[i]; w.obj = wrap(m, w.len, false, w.rotY); w.obj.position.set(...w.pos); w.base = w.obj.position.clone(); w.obj.visible = false; camera.add(w.obj); });
+  const zt = [wrap(z0, CFG.zombieHeight, true, 0), wrap(z1, CFG.zombieHeight, true, 0)];
+
+  /* ZOMBIS (RF05): distribuidos por tramo; los últimos son "corredores" más rápidos (RF11) */
+  for (let j = 0; j < 7; j++) {
+    const n = j === 0 ? 1 : j < 4 ? 2 : 3;
+    for (let i = 0; i < n; i++) {
+      const [x, z] = j === 0 ? [3, -22] : segPos(j), runner = j >= 3 && i === n - 1, o = skClone(zt[+runner]);
+      const zb = { obj: o, hp: CFG.hp, state: 'idle', runner, dead: false, dt: 0, flash: 0, ph: rnd() * 6 };
+      o.rotation.order = 'YXZ'; o.rotation.y = rnd() * 6.28; o.position.set(x, 0, z);
+      o.traverse(m => { if (m.isMesh) { m.frustumCulled = false; m.material = m.material.clone(); m.userData.z = zb; } });
+      scene.add(o); zombies.push(zb);
+    }
+  }
+  /* COLECCIONABLES (RF02/RF10): cajas de munición, una por tramo, alternando arma */
+  for (let j = 0; j < 7; j++) {
+    const [x, z] = segPos(j), type = j % 2, m = new THREE.Mesh(new THREE.BoxGeometry(.5, .35, .35),
+      new THREE.MeshStandardMaterial({ color: type ? 0x3399ff : 0xffcc33, emissive: type ? 0x113366 : 0x664400 }));
+    m.position.set(x, .6, z); scene.add(m); pickups.push({ m, type });
+  }
+  select(0); show('OPERACIÓN EXTRACCIÓN', 'Atraviesa la zona infestada, gestiona tu munición y llega a la zona de extracción verde.<br><br>WASD mover · Mouse mirar · Clic disparar (1 disparo por clic) · 1/2 cambiar arma<br>Recoge cajas amarillas (pistola) y azules (rifle) para obtener balas.', 'JUGAR');
+} catch (e) { $('s').innerHTML = 'Error cargando modelos: ' + e.message + '<br>Ejecuta el juego desde un servidor local (ver README), no con doble clic.'; throw e; }
+
+/* ================= UI / ESTADOS ================= */
+function show(t, s, b, fn) { $('t').textContent = t; $('s').innerHTML = s; $('b').textContent = b; $('b').style.display = 'block'; $('ov').style.display = 'flex'; action = fn || start; }
+$('b').onclick = () => action();
+function start() { renderer.domElement.requestPointerLock(); state = 'play'; $('ov').style.display = 'none'; }
+document.addEventListener('pointerlockchange', () => { if (!document.pointerLockElement && state === 'play') { state = 'pause'; show('PAUSA', 'Haz clic para continuar.', 'CONTINUAR'); } });
+const toast = t => { $('toast').textContent = t; clearTimeout(toast.id); toast.id = setTimeout(() => $('toast').textContent = '', 1500); };
+function end(kind) {
+  state = kind; document.exitPointerLock();
+  kind === 'over' ? show('GAME OVER', 'Un zombi te atrapó.', 'REINICIAR (R)', () => location.reload())
+                  : show('¡MISIÓN COMPLETADA!', 'Has llegado a la zona de extracción.', 'JUGAR DE NUEVO (R)', () => location.reload());
+}
+function select(i) { if (state !== 'play' && state !== 'menu') return; cur = i; WEAPONS.forEach((w, k) => w.obj.visible = k === i); }
+let ac; function beep(f, d, type = 'square') { try { ac = ac || new AudioContext(); const o = ac.createOscillator(), g = ac.createGain(); o.type = type; o.frequency.value = f;
+  o.frequency.exponentialRampToValueAtTime(f * .4, ac.currentTime + d); g.gain.setValueAtTime(.15, ac.currentTime); g.gain.exponentialRampToValueAtTime(.001, ac.currentTime + d);
+  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + d); } catch {} }
+
+/* ================= ENTRADA (RF06) ================= */
+addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'Digit1') select(0); if (e.code === 'Digit2') select(1);
+  if (e.code === 'KeyR' && (state === 'over' || state === 'win')) location.reload(); });
+addEventListener('keyup', e => keys[e.code] = false);
+addEventListener('mousemove', e => { if (state === 'play' && document.pointerLockElement) { yaw -= e.movementX * .0022; pitch = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * .0022)); } });
+addEventListener('mousedown', e => { if (e.button === 0 && state === 'play' && document.pointerLockElement) shoot(); }); // un evento por clic: sin autofuego
+
+/* ================= DISPARO (RF01/RF02/RF07) ================= */
+const ray = new THREE.Raycaster(); ray.far = 80;
+function shoot() {
+  const w = WEAPONS[cur], t = performance.now() / 1000;
+  if (t - lastShot < w.cd) return;
+  if (ammo[cur] <= 0) { beep(120, .06); toast('¡Sin munición! Busca una caja'); return; }   // bloqueo al llegar a 0
+  lastShot = t; ammo[cur]--; kick = 1; beep(cur ? 160 : 260, .12);
+  ray.setFromCamera(new THREE.Vector2(0, 0), camera);                                      // raycasting desde el centro de la pantalla
+  const hz = ray.intersectObjects(zombies.filter(z => !z.dead).map(z => z.obj), true)[0], hw = ray.intersectObjects(walls, false)[0];
+  if (hz && (!hw || hz.distance < hw.distance)) hit(hz.object.userData.z);                 // la pared tapa el disparo
+}
+function hit(z) {
+  z.hp--; z.flash = .12; $('cross').style.background = '#f33'; setTimeout(() => $('cross').style.background = '#ff3df0', 100);
+  if (z.hp <= 0) { z.dead = true; z.state = 'dead'; beep(80, .3, 'sawtooth'); }            // muere exactamente al 2.º impacto válido
+}
+
+/* ================= BUCLE PRINCIPAL ================= */
+const clock = new THREE.Clock();
+function update(dt, t) {
+  // jugador
+  const f = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), r = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  let mx = -Math.sin(yaw) * f + Math.cos(yaw) * r, mz = -Math.cos(yaw) * f - Math.sin(yaw) * r; const l = Math.hypot(mx, mz) || 1;
+  const nx = camera.position.x + mx / l * CFG.playerSpeed * dt, nz = camera.position.z + mz / l * CFG.playerSpeed * dt;
+  if (!blocked(nx, camera.position.z, .4)) camera.position.x = nx; if (!blocked(camera.position.x, nz, .4)) camera.position.z = nz;
+  const moving = f || r; bobT += moving ? dt * 9 : 0;
+  camera.position.y = 1.7 + Math.sin(bobT) * .04; camera.rotation.y = yaw; camera.rotation.x = pitch;
+  const w = WEAPONS[cur]; kick = Math.max(0, kick - dt * 6);
+  w.obj.position.set(w.base.x + Math.sin(bobT * .5) * .01, w.base.y + Math.abs(Math.sin(bobT)) * .01, w.base.z + kick * .06); w.obj.rotation.x = kick * .08;
+  flashL.intensity = kick > .7 ? 45 : 0;
+  // zombis (RF05/RF07/RF09)
+  const px = camera.position.x, pz = camera.position.z;
+  for (const z of zombies) {
+    const o = z.obj;
+    if (z.dead) { z.dt += dt; const k = Math.min(1, z.dt / .5); o.rotation.x = -k * Math.PI / 2; o.position.y = .15 * k; o.rotation.z = 0; }
+    else {
+      const dx = px - o.position.x, dz = pz - o.position.z, d = Math.hypot(dx, dz);
+      if (z.state === 'idle') { if (d < (z.runner ? CFG.runnerDetect : CFG.detect)) z.state = 'chase'; o.rotation.z = Math.sin(t * 1.5 + z.ph) * .04; }
+      else {
+        const sp = (z.runner ? CFG.runnerSpeed : CFG.zSpeed) * dt, zx = o.position.x + dx / d * sp, zz = o.position.z + dz / d * sp;
+        if (!blocked(zx, o.position.z, .4)) o.position.x = zx; if (!blocked(o.position.x, zz, .4)) o.position.z = zz;
+        o.rotation.y = Math.atan2(dx, dz); o.rotation.z = Math.sin(t * 9 + z.ph) * .08;
+        if (d < CFG.catchDist) return end('over');
+      }
+    }
+    if (z.flash > 0) { z.flash -= dt; o.traverse(m => m.isMesh && m.material.emissive && m.material.emissive.setHex(z.flash > 0 ? 0xff0000 : 0)); }
+  }
+  // cajas de munición
+  for (let i = pickups.length - 1; i >= 0; i--) { const p = pickups[i]; p.m.rotation.y += dt * 2; p.m.position.y = .6 + Math.sin(t * 3 + i) * .08;
+    if (Math.hypot(px - p.m.position.x, pz - p.m.position.z) < 1.2) { ammo[p.type] += WEAPONS[p.type].pack; toast('+' + WEAPONS[p.type].pack + ' balas de ' + WEAPONS[p.type].name); beep(600, .15, 'sine'); scene.remove(p.m); pickups.splice(i, 1); } }
+  // extracción (RF08)
+  if (Math.hypot(px, pz - CFG.goal) < CFG.goalRadius) end('win');
+}
+function hud() {
+  const alive = zombies.filter(z => !z.dead).length;
+  $('hud').innerHTML = WEAPONS.map((w, i) => `<span class="${i === cur ? '' : 'off'}">[${i + 1}] ${w.name}: <b>${ammo[i]}</b></span>`).join('<br>') +
+    `<br>Zombis: <b>${alive}</b><br>Extracción: <b>${Math.max(0, Math.round(camera.position.z - CFG.goal))} m</b>`;
+}
+renderer.setAnimationLoop(() => { const dt = Math.min(clock.getDelta(), .05), t = clock.elapsedTime; if (state === 'play' && zombies.length) update(dt, t); if (zombies.length) hud(); renderer.render(scene, camera); });
+</script></body></html>
